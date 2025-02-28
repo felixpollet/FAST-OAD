@@ -17,7 +17,7 @@ from typing import Dict
 
 import numpy as np
 import openmdao.api as om
-from pyDOE3 import lhs
+from pyDOE3 import lhs, fullfact
 from scipy.interpolate import interp1d
 
 from fastoad.module_management.constants import ModelDomain
@@ -50,10 +50,16 @@ class PayloadRange(om.Group, BaseMissionComp, NeedsOWE, NeedsMTOW, NeedsMFW):
         self.options.declare(
             "nb_grid_points",
             default=0,
-            types=int,
-            lower=0,
             desc="If >0, the provided number of points inside the payload-range "
-            "contour will be computed.",
+            "contour will be computed. For 'fullfact' doe_function, the value must be a list of 2 integers.",
+            check_valid=_validate_grid_points_option,
+        )
+        self.options.declare(
+            "doe_function",
+            default="lhs",
+            values=["fullfact", "lhs"],
+            desc="Function to generate the inner grid points. "
+            "Can be 'fullfact' or 'lhs'.",
         )
         self.options.declare(
             "grid_random_seed",
@@ -105,7 +111,10 @@ class PayloadRange(om.Group, BaseMissionComp, NeedsOWE, NeedsMTOW, NeedsMFW):
         )
 
         self._add_payload_range_contour_group()
-        if self.options["nb_grid_points"] > 0:
+
+        if isinstance(self.options["nb_grid_points"], int) and self.options["nb_grid_points"] == 0:
+            pass
+        else:
             self._add_payload_range_grid_group()
 
     def _update_mission_wrapper(self, name, value):
@@ -162,7 +171,17 @@ class PayloadRange(om.Group, BaseMissionComp, NeedsOWE, NeedsMTOW, NeedsMFW):
 
     def _add_payload_range_grid_group(self):
         """Creates the group for computing payload-range inner grid values."""
-        nb_grid_points = self.options["nb_grid_points"]
+
+        # Check if LHS or fullfact is used
+        if self.options["doe_function"] == "fullfact":
+            if not isinstance(self.options["nb_grid_points"], list):
+                raise ValueError("nb_grid_points must be a list of 2 integers for fullfact")
+            nb_grid_points = self.options["nb_grid_points"][0] * self.options["nb_grid_points"][1]
+
+        elif self.options["doe_function"] == "lhs":
+            if not isinstance(self.options["nb_grid_points"], int):
+                raise ValueError("nb_grid_points must be an integer for lhs")
+            nb_grid_points = self.options["nb_grid_points"]
 
         group = om.Group()
 
@@ -171,7 +190,8 @@ class PayloadRange(om.Group, BaseMissionComp, NeedsOWE, NeedsMTOW, NeedsMFW):
             "input_values",
             PayloadRangeGridInputValues(
                 mission_name=self.mission_name,
-                nb_points=nb_grid_points,
+                nb_points=self.options["nb_grid_points"],
+                doe_function=self.options["doe_function"],
                 PR_variable_prefix=self.variable_prefix,
                 random_seed=self.options["grid_random_seed"],
                 lhs_criterion=self.options["grid_lhs_criterion"],
@@ -431,8 +451,15 @@ class PayloadRangeGridInputValues(om.ExplicitComponent, BaseMissionComp, NeedsOW
         self.options.declare(
             "nb_points",
             default=20,
-            types=int,
-            desc='If >4, additional points are used in the final "MFW slope" of the diagram.',
+            desc="For LHS, the total number of points to be generated. "
+                 "For fullfact, a list of 2 integers, each integer corresponding to the number of points on each axis.",
+            check_valid=_validate_grid_points_option,
+        )
+        self.options.declare(
+            "doe_function",
+            default="lhs",
+            values=["fullfact", "lhs"],
+            desc="Function to generate the inner grid points. "
         )
         self.options.declare(
             "PR_variable_prefix",
@@ -480,6 +507,8 @@ class PayloadRangeGridInputValues(om.ExplicitComponent, BaseMissionComp, NeedsOW
             self.options["PR_variable_prefix"], self.mission_name, grid=True
         )
         nb_points = self.options["nb_points"]
+        if self.options["doe_function"] == "fullfact":
+            nb_points = self.options["nb_points"][0] * self.options["nb_points"][1]
 
         self.add_input(self._contour_names.payload, val=np.nan, shape_by_conn=True, units="kg")
         self.add_input(self._contour_names.block_fuel, val=np.nan, shape_by_conn=True, units="kg")
@@ -502,19 +531,26 @@ class PayloadRangeGridInputValues(om.ExplicitComponent, BaseMissionComp, NeedsOW
         max_payload = payload_contour_values[0]
         get_max_block_fuel = interp1d(payload_contour_values[1:], block_fuel_contour_values[1:])
 
-        lhs_grid = lhs(
-            2,
-            criterion=self.options["lhs_criterion"],
-            samples=(self.options["nb_points"]),
-            random_state=self.options["random_seed"],
-        )
-        payload_values = (
-            ((min_payload_ratio + (1.0 - min_payload_ratio) * lhs_grid[:, 1]) * max_payload),
-        )
-        block_fuel_values = (
-            min_block_fuel_ratio + (1.0 - min_block_fuel_ratio) * lhs_grid[:, 0]
-        ) * get_max_block_fuel(payload_values)
-
+        payload_values = np.zeros(0)
+        block_fuel_values = np.zeros(0)
+        if self.options["doe_function"] == "lhs":
+            grid = lhs(
+                2,
+                criterion=self.options["lhs_criterion"],
+                samples=(self.options["nb_points"]),
+                random_state=self.options["random_seed"],
+            )
+            payload_values = (min_payload_ratio + (1.0 - min_payload_ratio) * grid[:, 1]) * max_payload
+            block_fuel_values = (min_block_fuel_ratio + (1.0 - min_block_fuel_ratio) * grid[:, 0]) * get_max_block_fuel(
+                payload_values)
+        elif self.options["doe_function"] == "fullfact":
+            block_fuel_levels = self.options["nb_points"][0]
+            payload_levels = self.options["nb_points"][1]
+            grid = fullfact([block_fuel_levels, payload_levels])
+            payload_values = (min_payload_ratio + (1.0 - min_payload_ratio) * grid[:, 1] / max(1.0, (
+                        payload_levels - 1))) * max_payload
+            block_fuel_values = (min_block_fuel_ratio + (1.0 - min_block_fuel_ratio) * grid[:, 0] / max(1.0, (
+                        block_fuel_levels - 1))) * get_max_block_fuel(payload_values)
         payload_values = np.append(payload_values, payload_contour_values[1:3])
         block_fuel_values = np.append(block_fuel_values, block_fuel_contour_values[1:3])
 
@@ -554,6 +590,15 @@ def _get_property(suffix):
         return self.get_variable_name(suffix)
 
     return property(prop)
+
+
+def _validate_grid_points_option(name, value):
+    """Ensure value is either a positive int or a list of positive ints."""
+    if isinstance(value, int) and value >= 0:
+        return
+    if isinstance(value, list) and len(value) == 2 and all(isinstance(x, int) for x in value) and all(x >= 0 for x in value):
+        return
+    raise ValueError(f"Option '{name}' must be an int or a list of ints, but got {value}")
 
 
 for main_name in [
